@@ -1,0 +1,275 @@
+services:
+  # PostgreSQL with PostGIS and persistent storage.
+  postgres:
+    image: postgis/postgis:15-3.3  # adjust tag/version as needed
+    container_name: postgres
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - db_net
+      - backend_net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PgBouncer for connection pooling.
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pgbouncer
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+    ports:
+      - "6432:6432"
+    depends_on:
+      - postgres
+    networks:
+      - db_net
+      - backend_net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "postgres", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostGraphile GraphQL API service.
+  postgraphile:
+    image: graphile/postgraphile:latest
+    container_name: postgraphile
+    restart: always
+    env_file:
+      - .env
+    environment:
+      # Connect via PgBouncer for efficient connection management.
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      - JWT_SECRET=${JWT_SECRET}
+      # (Additional PostGraphile settings can be passed here.)
+    depends_on:
+      - pgbouncer
+    networks:
+      - backend_net
+    ports:
+      - "5000:5000"
+    healthcheck:
+      # Assumes a health endpoint is exposed; adjust as needed.
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Graphile Worker for background job processing.
+  graphile_worker:
+    image: graphile/worker:latest
+    container_name: graphile_worker
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+    depends_on:
+      - pgbouncer
+    networks:
+      - backend_net
+    healthcheck:
+      # Update the command if Graphile Worker exposes a different health endpoint.
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Fastify-based API Gateway / Webhook Processor.
+  fastify_webhook:
+    image: myorg/fastify-webhook:latest  # Replace with your actual image.
+    container_name: fastify_webhook
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      # (Other environment variables as required.)
+    depends_on:
+      - graphile_worker
+    networks:
+      - backend_net
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Traefik reverse proxy & API gateway.
+  traefik:
+    image: traefik:v2.9
+    container_name: traefik
+    restart: always
+    command:
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - traefik_certificates:/letsencrypt
+    networks:
+      - proxy_net
+      - backend_net
+
+  # Prometheus for metrics.
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: always
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Alertmanager for alerts.
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    restart: always
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana for dashboards & visualization.
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "3001:3000"
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Loki for log aggregation.
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: always
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Metabase for BI & analytics.
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    restart: always
+    ports:
+      - "3002:3000"
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # PostgreSQL Exporter for database monitoring.
+  postgres_exporter:
+    image: wrouesnel/postgres_exporter:latest
+    container_name: postgres_exporter
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATA_SOURCE_NAME=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    ports:
+      - "9187:9187"
+    depends_on:
+      - postgres
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9187/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # SMTP server for testing (using MailHog).
+  smtp_server:
+    image: mailhog/mailhog:latest
+    container_name: smtp_server
+    restart: always
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - backend_net
+
+  # Prism for mocking external APIs (e.g., Twilio).
+  prism:
+    image: stoplight/prism:latest
+    container_name: prism
+    restart: always
+    command: mock -h 0.0.0.0 -p 4010 /path/to/openapi.yaml  # Adjust the path to your OpenAPI spec.
+    ports:
+      - "4010:4010"
+    networks:
+      - backend_net
+
+volumes:
+  postgres_data:
+  traefik_certificates:
+
+networks:
+  db_net:
+  backend_net:
+  proxy_net:
