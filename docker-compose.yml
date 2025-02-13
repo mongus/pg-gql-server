@@ -1,96 +1,71 @@
+name: pg_gql_server
+
 services:
   # PostgreSQL with PostGIS and persistent storage.
   postgres:
-    image: postgis/postgis:15-3.3  # adjust tag/version as needed
+    image: postgis/postgis:17-master  # adjust tag/version as needed
     container_name: postgres
     restart: always
     env_file:
       - .env
     environment:
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRAPHILE_SCHEMA=${POSTGRAPHILE_SCHEMA:-public}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./volumes/postgres/data:/var/lib/postgresql/data
+      - ./volumes/postgres/initdb:/docker-entrypoint-initdb.d:ro
     networks:
       - db_net
       - backend_net
+#    ports:
+#      - "5432:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
       interval: 10s
       timeout: 5s
       retries: 5
-
-  # PgBouncer for connection pooling.
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    container_name: pgbouncer
-    restart: always
-    env_file:
-      - .env
-    environment:
-      - DB_USER=${POSTGRES_USER}
-      - DB_PASSWORD=${POSTGRES_PASSWORD}
-      - DB_HOST=postgres
-      - DB_PORT=5432
-      - DB_NAME=${POSTGRES_DB}
-    ports:
-      - "6432:6432"
-    depends_on:
-      - postgres
-    networks:
-      - db_net
-      - backend_net
-    healthcheck:
-      test: ["CMD", "pg_isready", "-h", "postgres", "-U", "${POSTGRES_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      start_period: 1s
 
   # PostGraphile GraphQL API service.
   postgraphile:
-    image: graphile/postgraphile:latest
+    build:
+      context: ./postgraphile/
+      dockerfile: Dockerfile
+    ports:
+      - "5678:5678"
     container_name: postgraphile
     restart: always
     env_file:
       - .env
     environment:
-      # Connect via PgBouncer for efficient connection management.
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
-      - JWT_SECRET=${JWT_SECRET}
-      # (Additional PostGraphile settings can be passed here.)
+      - DATABASE_URL=postgres://${POSTGRAPHILE_USER}:${POSTGRAPHILE_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - SUPERUSER_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - GRAPHILE_ENV=${STAGE:-development}
+      - GRAPHQL_PORT=${GRAPHQL_PORT:-5678}
+      - POSTGRAPHILE_SCHEMA=${POSTGRAPHILE_SCHEMA:-public}
+    volumes:
+      - ./volumes/postgraphile/graphile.config.mjs:/home/node/graphile.config.mjs:ro
     depends_on:
-      - pgbouncer
+      postgres:
+        condition: service_healthy
     networks:
       - backend_net
-    ports:
-      - "5000:5000"
-    healthcheck:
-      # Assumes a health endpoint is exposed; adjust as needed.
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - proxy_net
 
   # Graphile Worker for background job processing.
   graphile_worker:
     image: graphile/worker:latest
     container_name: graphile_worker
     restart: always
-    env_file:
-      - .env
     environment:
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}
+      - DATABASE_URL=postgres://${POSTGRAPHILE_USER}:${POSTGRAPHILE_PASSWORD}@postgres:5432/${POSTGRES_DB}
     depends_on:
-      - pgbouncer
+      postgres:
+        condition: service_healthy
     networks:
       - backend_net
-    healthcheck:
-      # Update the command if Graphile Worker exposes a different health endpoint.
-      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    volumes:
+      - ./volumes/graphile-worker/tasks:/worker/tasks:ro
+      - ./volumes/graphile-worker/crontab:/worker/crontab:ro
 
   # Fastify-based API Gateway / Webhook Processor.
   fastify_webhook:
@@ -99,9 +74,6 @@ services:
     restart: always
     env_file:
       - .env
-    environment:
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
-      # (Other environment variables as required.)
     depends_on:
       - graphile_worker
     networks:
@@ -113,6 +85,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    profiles:
+      - webhook
 
   # Traefik reverse proxy & API gateway.
   traefik:
@@ -132,11 +106,13 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - traefik_certificates:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./volumes/traefik/certificates:/letsencrypt
     networks:
       - proxy_net
       - backend_net
+    profiles:
+      - proxy
 
   # Prometheus for metrics.
   prometheus:
@@ -144,7 +120,7 @@ services:
     container_name: prometheus
     restart: always
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./volumes/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
       - "9090:9090"
     networks:
@@ -154,6 +130,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    profiles:
+      - monitoring
 
   # Alertmanager for alerts.
   alertmanager:
@@ -161,7 +139,7 @@ services:
     container_name: alertmanager
     restart: always
     volumes:
-      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ./volumes/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     ports:
       - "9093:9093"
     networks:
@@ -171,6 +149,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    profiles:
+      - monitoring
 
   # Grafana for dashboards & visualization.
   grafana:
@@ -188,6 +168,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    profiles:
+      - monitoring
 
   # Loki for log aggregation.
   loki:
@@ -198,7 +180,7 @@ services:
       - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
     volumes:
-      - ./loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - ./volumes/loki/local-config.yaml:/etc/loki/local-config.yaml:ro
     networks:
       - backend_net
     healthcheck:
@@ -206,6 +188,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    profiles:
+      - monitoring
 
   # Metabase for BI & analytics.
   metabase:
@@ -214,13 +198,18 @@ services:
     restart: always
     ports:
       - "3002:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - backend_net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
-      interval: 10s
+      test: curl --fail -I http://localhost:3000/api/health || exit 1
+      interval: 15s
       timeout: 5s
       retries: 5
+    profiles:
+      - bi
 
   # PostgreSQL Exporter for database monitoring.
   postgres_exporter:
@@ -242,6 +231,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    profiles:
+      - monitoring
 
   # SMTP server for testing (using MailHog).
   smtp_server:
@@ -253,6 +244,8 @@ services:
       - "8025:8025"
     networks:
       - backend_net
+    profiles:
+      - test
 
   # Prism for mocking external APIs (e.g., Twilio).
   prism:
@@ -264,10 +257,8 @@ services:
       - "4010:4010"
     networks:
       - backend_net
-
-volumes:
-  postgres_data:
-  traefik_certificates:
+    profiles:
+      - test
 
 networks:
   db_net:
