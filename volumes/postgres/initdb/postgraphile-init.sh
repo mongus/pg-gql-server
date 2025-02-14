@@ -23,26 +23,22 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
     CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
     -- Create PostGraphile user
-    CREATE ROLE ${POSTGRAPHILE_USER} WITH LOGIN CREATEROLE PASSWORD '${POSTGRAPHILE_PASSWORD}';
+    CREATE ROLE ${POSTGRAPHILE_USER} WITH LOGIN PASSWORD '${POSTGRAPHILE_PASSWORD}';
     -- Grant all privileges on the database to the PostGraphile user
     GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO ${POSTGRAPHILE_USER};
 
-    -- Create Superuser role
-    CREATE ROLE superuser WITH CREATEROLE IN ROLE ${POSTGRAPHILE_USER} ADMIN ${POSTGRAPHILE_USER};
-    GRANT ALL PRIVILEGES ON DATABASE ${POSTGRES_DB} TO superuser;
+    CREATE ROLE superadmin WITH SUPERUSER;
+    GRANT superadmin TO ${POSTGRAPHILE_USER};
 
     -- Create the exposed schema if necessary
     CREATE SCHEMA IF NOT EXISTS ${EXPOSED_SCHEMA};
     -- Grant all privileges on the exposed schema to the PostGraphile user
     ALTER SCHEMA ${EXPOSED_SCHEMA} OWNER TO ${POSTGRAPHILE_USER};
 
-    GRANT ALL PRIVILEGES ON SCHEMA ${EXPOSED_SCHEMA} TO superuser;
-
     \\c ${POSTGRES_DB} ${POSTGRAPHILE_USER}
 
     -- Create the auth schema that will manage user authentication
     CREATE SCHEMA IF NOT EXISTS ${AUTH_SCHEMA};
-    GRANT ALL PRIVILEGES ON SCHEMA ${AUTH_SCHEMA} TO superuser;
 
     -- Create the ${AUTH_SCHEMA}.jwt_token type that is used by PostGraphile
     CREATE TYPE ${AUTH_SCHEMA}.jwt_token AS (uid ${USER_ID_TYPE}, role TEXT, exp INTEGER);
@@ -88,7 +84,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
       RETURNING id
     )
     INSERT INTO ${AUTH_SCHEMA}.local_logins (user_id, username, role, hashed_password)
-    SELECT id, '${ADMIN_USER}', 'superuser', ${AUTH_SCHEMA}.hash_password('${ADMIN_PASSWORD}')
+    SELECT id, '${ADMIN_USER}', 'superadmin', ${AUTH_SCHEMA}.hash_password('${ADMIN_PASSWORD}')
     FROM new_user;
 
     -- Create login function
