@@ -13,7 +13,6 @@ services:
       - AUTH_SCHEMA=${AUTH_SCHEMA:-auth}
       - USER_ID_TYPE=${USER_ID_TYPE:-UUID}
     volumes:
-      - ./volumes/postgres/data:/var/lib/postgresql/data
       - ./volumes/postgres/initdb:/docker-entrypoint-initdb.d:ro
     networks:
       - db_net
@@ -43,7 +42,8 @@ services:
       - SUPERUSER_DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       - GRAPHILE_ENV=${STAGE:-development}
       - GRAPHQL_PORT=${GRAPHQL_PORT:-5678}
-      - POSTGRAPHILE_SCHEMA=${POSTGRAPHILE_SCHEMA:-public}
+      - EXPOSED_SCHEMA=${EXPOSED_SCHEMA:-public}
+      - AUTH_SCHEMA=${AUTH_SCHEMA:-auth}
       - JWT_TTL=${JWT_TTL:-1h}
     volumes:
       - ./volumes/postgraphile/graphile.config.mjs:/home/node/graphile.config.mjs:ro

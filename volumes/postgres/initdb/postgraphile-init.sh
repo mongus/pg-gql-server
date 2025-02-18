@@ -21,6 +21,7 @@ esac
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
     CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
     CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+    CREATE EXTENSION IF NOT EXISTS "citext";
 
     -- Create PostGraphile user
     CREATE ROLE ${POSTGRAPHILE_USER} WITH LOGIN PASSWORD '${POSTGRAPHILE_PASSWORD}';
@@ -29,6 +30,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
 
     CREATE ROLE superadmin WITH SUPERUSER;
     GRANT superadmin TO ${POSTGRAPHILE_USER};
+
+    CREATE ROLE anonymous;
+    GRANT anonymous TO ${POSTGRAPHILE_USER};
+
+    CREATE ROLE ${POSTGRAPHILE_USER}_user;
+    GRANT ${POSTGRAPHILE_USER}_user TO ${POSTGRAPHILE_USER};
 
     -- Create the exposed schema if necessary
     CREATE SCHEMA IF NOT EXISTS ${EXPOSED_SCHEMA};
@@ -41,7 +48,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
     CREATE SCHEMA IF NOT EXISTS ${AUTH_SCHEMA};
 
     -- Create the ${AUTH_SCHEMA}.jwt_token type that is used by PostGraphile
-    CREATE TYPE ${AUTH_SCHEMA}.jwt_token AS (uid ${USER_ID_TYPE}, role TEXT, exp INTEGER);
+    CREATE TYPE ${AUTH_SCHEMA}.jwt_token AS (role TEXT, exp INTEGER, uid ${USER_ID_TYPE});
     COMMENT ON TYPE ${AUTH_SCHEMA}.jwt_token IS 'JWT token injected by PostGraphile.';
 
     CREATE OR REPLACE FUNCTION ${AUTH_SCHEMA}.uid() RETURNS ${USER_ID_TYPE} AS \$\$
@@ -55,18 +62,25 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
       first_name TEXT,
       last_name TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      deleted_at TIMESTAMPTZ
+      archived_at TIMESTAMPTZ
     );
+    COMMENT ON TABLE ${EXPOSED_SCHEMA}.users IS
+      E'@behavior -insert -delete';
+    GRANT SELECT ON ${EXPOSED_SCHEMA}.users TO ${POSTGRAPHILE_USER}_user;
+    ALTER TABLE ${EXPOSED_SCHEMA}.users ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY owner_policy ON ${EXPOSED_SCHEMA}.users
+      TO ${POSTGRAPHILE_USER}_user
+      USING (id = ${AUTH_SCHEMA}.uid());
 
     -- Create the local login table
     CREATE TABLE IF NOT EXISTS ${AUTH_SCHEMA}.local_logins (
       user_id ${USER_ID_TYPE} PRIMARY KEY REFERENCES ${EXPOSED_SCHEMA}.users(id),
-      username TEXT UNIQUE,
-      email TEXT UNIQUE,
-      hashed_password TEXT NOT NULL DEFAULT 'EMPTY',
-      role TEXT NOT NULL,
+      username CITEXT UNIQUE,
+      email CITEXT UNIQUE,
+      password TEXT NOT NULL DEFAULT 'EMPTY',
+      role TEXT NOT NULL DEFAULT '${POSTGRAPHILE_USER}_user',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      deleted_at TIMESTAMPTZ
+      archived_at TIMESTAMPTZ
     );
     COMMENT ON TABLE ${AUTH_SCHEMA}.local_logins IS
       'Local (non-federated) login using email and password.';
@@ -83,12 +97,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
       VALUES ('Super', 'Admin')
       RETURNING id
     )
-    INSERT INTO ${AUTH_SCHEMA}.local_logins (user_id, username, role, hashed_password)
+    INSERT INTO ${AUTH_SCHEMA}.local_logins (user_id, username, role, password)
     SELECT id, '${ADMIN_USER}', 'superadmin', ${AUTH_SCHEMA}.hash_password('${ADMIN_PASSWORD}')
     FROM new_user;
 
-    -- Create login function
-    CREATE OR REPLACE FUNCTION ${EXPOSED_SCHEMA}.login(
+    -- Create authenticate function
+    CREATE OR REPLACE FUNCTION ${EXPOSED_SCHEMA}.authenticate(
       username TEXT,
       password TEXT
     ) RETURNS ${AUTH_SCHEMA}.jwt_token as \$\$
@@ -99,11 +113,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
       IF \$1 LIKE '%@%' THEN
         SELECT
          * INTO local_login
-        FROM ${AUTH_SCHEMA}.local_logins
+        FROM ${AUTH_SCHEMA}.local_logins l
         WHERE
          email = \$1
-         AND deleted_at IS NULL
-         AND CRYPT(\$2, hashed_password) = hashed_password;
+         AND archived_at IS NULL
+         AND CRYPT(\$2, l.password) = l.password;
       END IF;
 
       IF local_login IS NULL THEN
@@ -112,8 +126,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
         FROM ${AUTH_SCHEMA}.local_logins l
         WHERE
          l.username = \$1
-         AND deleted_at IS NULL
-         AND CRYPT(\$2, hashed_password) = hashed_password;
+         AND archived_at IS NULL
+         AND CRYPT(\$2, l.password) = l.password;
       END IF;
 
       IF local_login IS NULL THEN
@@ -125,14 +139,14 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "${POSTGRES_DB}" <<-EOSQL
       FROM ${EXPOSED_SCHEMA}.users
       WHERE
        id = local_login.user_id
-       AND deleted_at IS NULL;
+       AND archived_at IS NULL;
 
       IF user_id IS NULL THEN
         RETURN NULL;
       END IF;
 
-      RETURN (user_id, local_login.role, EXTRACT(EPOCH FROM NOW()) + (${JWT_TTL}))::${AUTH_SCHEMA}.jwt_token;
+      RETURN (local_login.role, EXTRACT(EPOCH FROM NOW()) + (${JWT_TTL}), user_id)::${AUTH_SCHEMA}.jwt_token;
     END;
     \$\$ LANGUAGE PLPGSQL STRICT SECURITY DEFINER;
-    GRANT EXECUTE ON FUNCTION ${EXPOSED_SCHEMA}.login(TEXT, TEXT) TO PUBLIC;
+    GRANT EXECUTE ON FUNCTION ${EXPOSED_SCHEMA}.authenticate(TEXT, TEXT) TO PUBLIC;
 EOSQL

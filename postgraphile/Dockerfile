@@ -3,7 +3,7 @@ FROM node:22-alpine
 USER node
 WORKDIR /home/node
 
-RUN npm i postgraphile@beta
+RUN npm i postgraphile@beta @graphile/simplify-inflection@beta @graphile-contrib/pg-omit-archived@v4.0.0-beta.3
 
 ENV GRAPHQL_PORT=5678
 
